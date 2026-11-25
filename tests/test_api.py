@@ -179,6 +179,30 @@ class TestMeta:
         x = meta.find_undeclared_variables(ast)
         assert x == {"foo"}
 
+    def test_find_undeclared_variables_set_in_if_elif_else(self, env):
+        # https://github.com/pallets/jinja/issues/2069
+        # ``output`` is assigned on every path through the if/elif/else
+        # chain, so it is never looked up from the context.
+        ast = env.parse(
+            "{% if control == 1 %}{% set output = 1 %}"
+            "{% elif control == 2 %}{% set output = 2 %}"
+            "{% else %}{% set output = 3 %}{% endif %}"
+            "{{ output }}"
+        )
+        x = meta.find_undeclared_variables(ast)
+        assert x == {"control"}
+
+    def test_find_undeclared_variables_set_in_if_else(self, env):
+        # Variant of #2069 reported in the issue comments: plain if/else,
+        # which also fails on 3.1.4.
+        ast = env.parse(
+            "{% if control %}{% set output = 1 %}"
+            "{% else %}{% set output = 2 %}{% endif %}"
+            "{{ output }}"
+        )
+        x = meta.find_undeclared_variables(ast)
+        assert x == {"control"}
+
     def test_find_refererenced_templates(self, env):
         ast = env.parse('{% extends "layout.html" %}{% include helper %}')
         i = meta.find_referenced_templates(ast)
