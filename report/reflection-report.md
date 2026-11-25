@@ -150,8 +150,6 @@ The agent formed three hypotheses and tested each one by running code. Every cla
 | H2 | 3.1.5 regressed by removing a correct check, so restoring it fixes the bug | Read the 3.1.4 → 3.1.5 history of `idtracking.py` and found `66587ce9`. Swapped the 3.1.4 function into 3.1.6 at runtime and ran the tests (`report/scripts/revert_314_check.py`) | Rejected: the issue's test passes, but the `if/else` test still fails and the #1253 regression test fails again |
 | H3 | Fixed three-slot branches and shared `elif` analysis distort the "all branches" count | Inspected the parsed AST (each `elif` is a nested `If`). Rendered a two-`elif` template on 3.1.4 and 3.1.6 | Confirmed: 3.1.4 renders `''` instead of the context value, a latent bug |
 
-> **Figure 2 (screenshot to add):** the `branch_update` trace for the issue template on 3.1.4 vs. 3.1.6.
-
 ### 2.3 Assumptions, detours and guidance
 
 - **It did not rely on the issue's explanation.** The issue blames 3.1.5, and the obvious fix is to revert that change. The agent tested the revert before proposing it, and the test results showed the revert would reintroduce #1253. A less careful agent could easily have submitted that revert as the fix.
