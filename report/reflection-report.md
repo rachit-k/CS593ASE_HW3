@@ -45,17 +45,11 @@ The bug occurs whenever a name is assigned on *every* path through an `if` that 
 
 `find_undeclared_variables()` doesn't analyze templates itself. It runs Jinja's real code generator in a mode that writes no code and collects every name the generated code would look up from the context.
 
-![Call path from find_undeclared_variables into idtracking](images/find_undeclared_variables_call_path.png)
-
-*Figure 1. Call path from the public function to the code that decides each variable's lookup.*
-
 - **`meta.py`:** `TrackingCodeGenerator` subclasses `CodeGenerator`. Its `enter_frame()` keeps every symbol whose load action is `resolve` (look it up in the context). That set is the function's result.
 - **`compiler.py`:** `CodeGenerator` builds a `Frame` for each scope (template body, `for` loop, macro). For the issue's template, the generated code starts with `l_0_output = resolve('output')`, so the context lookup comes from the compiler's own symbol table, not from a separate mistake in `meta.py`.
 - **`idtracking.py`:** `FrameSymbolVisitor.visit_If()` analyzes each branch of an `if` separately, then `Symbols.branch_update()` merges the branches back into the enclosing scope and decides each name's load action. This is where Part 2 starts.
 
 **How the agent found these.** It ran `/graphify` to build a knowledge graph of the repository (about 2,800 nodes), then followed the graph's call and inheritance edges from `find_undeclared_variables` to `branch_update`. It then read only those three files. Along the way it found that the clone was on `main` (164 commits past 3.1.6), not on 3.1.6 as I had told it, and moved the work onto a branch created from the `3.1.6` tag.
-
-> **Figure 2 (screenshot to add):** the agent's graph traversal output showing the `meta → compiler → idtracking` chain.
 
 ### 1.3 Reproduction tests
 
@@ -97,17 +91,73 @@ E         'output'
 
 Full suite: **2 failed, 909 passed**. Before the tests were added, the suite was 909 passed.
 
-> **Figure 3 (screenshot to add):** the failing pytest run above.
+![The two reproduction tests failing on Jinja 3.1.6](images/FailingTests.png)
+
+*Figure 1. The two reproduction tests failing on unmodified Jinja 3.1.6.*
 
 ---
 
 ## 2. Bug Localization and Root Cause Analysis
 
-*To be completed in Part 2.*
+### 2.1 Root cause
 
-- Root cause and the relevant source code
-- How the agent investigated and reached its diagnosis
-- Incorrect assumptions, irrelevant code explored, or guidance needed
+`meta.py` is not at fault. It correctly reports what the compiler decided. The false positive comes from `Symbols.branch_update()` in `src/jinja2/idtracking.py` (L123–145). This function merges the symbol tables of an `if` statement's branches back into the enclosing scope. In 3.1.6 it marks every name assigned in *any* branch as `resolve` ("look it up in the context"). It never asks whether every path assigns that name before reading it.
+
+```python
+def branch_update(self, branch_symbols):          # idtracking.py, 3.1.6
+    stores = set()
+    for branch in branch_symbols:
+        stores.update(branch.stores)              # names assigned in ANY branch
+    stores.difference_update(self.stores)         # ...that weren't defined before the if
+    for sym in branch_symbols:
+        self.refs.update(sym.refs)
+        self.loads.update(sym.loads)              # per-branch loads: last branch wins
+        self.stores.update(sym.stores)
+    for name in stores:                           # every such name ->
+        ...                                       #   alias (if an outer scope has it)
+        self.loads[target] = (VAR_LOAD_RESOLVE, name)   # or resolve
+```
+
+The code generator emits `l_0_output = resolve('output')` for each `resolve` load. `TrackingCodeGenerator.enter_frame()` in `meta.py` collects exactly these names. So `output` is reported even though every branch overwrites it before it is printed. Rendering is unaffected: the lookup is wasted, but the result is correct. That is why the problem only shows up through `find_undeclared_variables()`.
+
+**Why simply restoring the old check does not work.** Jinja 3.1.4 skipped names stored in *all* branches. Commit `66587ce9` ("Fix bug where set would sometimes fail within if", for issue #1253, released in 3.1.5) removed that shortcut. The 3.1.4 rule was wrong in three ways, which explains both the original crash and the inconsistent results in Section 1.1:
+
+1. **Merging is "last branch wins".** Each branch's own symbol table already records the right answer for that branch:
+    - `undefined` means the branch assigns the name before reading it.
+    - `resolve` means the branch reads it first.
+
+    But `self.loads.update(sym.loads)` lets a later branch overwrite an earlier one. In #1253 the `if` body reads `a` before setting it (`resolve`), and the `else` branch's `undefined` replaced that. Rendering then raised `UndefinedError`. The 3.1.5 fix avoided the overwrite by forcing `resolve` for every conditionally assigned name, which is what created #2069.
+2. **An `if` is always analyzed as exactly three branches.** `FrameSymbolVisitor.visit_If()` (L252–268) passes three symbol tables: the body, *all* `elif`s together, and the `else`. Missing ones are passed as empty tables, so a plain `if/else` has an empty `elif` slot that looks like a path that assigns nothing. In 3.1.4 the variable then counted as stored in 2 of 3 branches and was marked `resolve`. This is why `if/else` already failed on 3.1.4.
+3. **All `elif`s share one table.** The parser stores each `elif` as a nested `If` node with no `elif` or `else` of its own. `visit_If` analyzes them one after another in the *same* copy, so an assignment in the first `elif` hides a later `elif` that assigns nothing. In 3.1.4, `{% if x %}{% set y=1 %}{% elif a %}{% set y=2 %}{% elif b %}{% else %}{% set y=3 %}{% endif %}{{ y }}` renders `''` instead of the context's `y` when `elif b` runs, and the function misses `y`. 3.1.6 is correct here only because it marks everything as `resolve`.
+
+**Root cause in one sentence:** the symbol tracker cannot represent "this name is assigned on every path through the `if` before it is read". The branches are merged last-wins into three fixed slots. 3.1.5 replaced a check that was wrong in both directions with the most conservative answer, `resolve`, and `meta` faithfully reports it.
+
+| `branch_update` rule | #2069 `if/elif/else` | `if/else` | #1253 read-before-set | two `elif`s, one skips |
+| --- | --- | --- | --- | --- |
+| 3.1.4: skip names stored in all 3 slots | correct (by luck) | false positive | **render crash** | **wrong render, `y` missed** |
+| 3.1.5+: every stored name → `resolve` | false positive | false positive | correct | correct |
+| Required | `y` not reported | `y` not reported | `a` reported | `y` reported |
+
+For the fix (Part 3), this means a name assigned inside an `if` may be left out only when two conditions hold. First, every real path (the body, *each* `elif`, and an `else` that actually exists) assigns it. Second, no path reads it before assigning it. The existing test `test_regression.py::test_load_parameter_when_set_in_all_if_branches` (#1253) and the `tests/test_idtracking.py` branching tests must keep passing.
+
+### 2.2 How the agent investigated
+
+The agent formed three hypotheses and tested each one by running code. Every claim was backed by a trace, a test run or a render.
+
+| # | Hypothesis | How it was tested | Result |
+| --- | --- | --- | --- |
+| H1 | The extra name comes from the compiler's symbol table, not from `meta.py` | Wrapped `Symbols.branch_update` to print each branch's stores and loads and the merged result (`report/scripts/root_cause_diagnostics.py`) | Confirmed: every branch says `undefined`, and the merge outputs `resolve` |
+| H2 | 3.1.5 regressed by removing a correct check, so restoring it fixes the bug | Read the 3.1.4 → 3.1.5 history of `idtracking.py` and found `66587ce9`. Swapped the 3.1.4 function into 3.1.6 at runtime and ran the tests (`report/scripts/revert_314_check.py`) | Rejected: the issue's test passes, but the `if/else` test still fails and the #1253 regression test fails again |
+| H3 | Fixed three-slot branches and shared `elif` analysis distort the "all branches" count | Inspected the parsed AST (each `elif` is a nested `If`). Rendered a two-`elif` template on 3.1.4 and 3.1.6 | Confirmed: 3.1.4 renders `''` instead of the context value, a latent bug |
+
+> **Figure 2 (screenshot to add):** the `branch_update` trace for the issue template on 3.1.4 vs. 3.1.6.
+
+### 2.3 Assumptions, detours and guidance
+
+- **It did not rely on the issue's explanation.** The issue blames 3.1.5, and the obvious fix is to revert that change. The agent tested the revert before proposing it, and the test results showed the revert would reintroduce #1253. A less careful agent could easily have submitted that revert as the fix.
+- **It stayed on relevant code.** It did not open the lexer, parser internals or runtime. It read only `idtracking.py`, the scope handling in `compiler.py`, and the git history of `idtracking.py`.
+- **It looked at code from another Jinja version.** It read the 3.1.4 → 3.1.5 diff of `idtracking.py`. That is the change that *caused* the regression, not a fix for #2069, so it is ordinary bug localization (similar to `git bisect`). It is still worth stating against the assignment's no-copying rule. The 3.1.4 code was used only as a diagnostic and is not part of the fix.
+- **No extra guidance was needed.** I gave one prompt ("move on to part 2"), and the agent needed no corrections from me.
 
 ## 3. Patch Implementation and Validation
 
