@@ -1,6 +1,6 @@
 # Homework 3 Reflection Report: Fixing Jinja #2069 with a Coding Agent
 
-Rachit · CS593 ASE · Repository: `<your-repo-url>` · Branch: `hw3-fix-2069` (from tag `3.1.6`)
+Rachit · CS593 ASE · Repository: [rachit-k/CS593ASE_HW3](https://github.com/rachit-k/CS593ASE_HW3) · Branch: `hw3-fix-2069` (from tag `3.1.6`)
 
 **Coding agent:** Claude Code (Claude Opus 5.5), VS Code extension, with the graphify skill for building a repository knowledge graph.
 
@@ -75,7 +75,7 @@ The tests that check variables which *must* still be reported (no `else`, a bran
 The branch was created from the release tag with `git switch -c hw3-fix-2069 3.1.6`. To reproduce from a fresh clone:
 
 ```bash
-git clone <your-repo-url> jinja && cd jinja
+git clone https://github.com/rachit-k/CS593ASE_HW3.git && cd CS593ASE_HW3
 git switch hw3-fix-2069          # the branch already exists on the remote
 python3.12 -m venv .venv
 .venv/bin/pip install -r requirements/tests.txt -e .
