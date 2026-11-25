@@ -1,5 +1,16 @@
 .. currentmodule:: jinja2
 
+Version 3.1.7
+-------------
+
+Unreleased
+
+-   A variable that is assigned in every branch of an ``{% if %}`` block,
+    before being read, is not looked up from the context.
+    ``meta.find_undeclared_variables`` no longer reports it. Each ``elif`` is
+    tracked as a separate branch. :issue:`2069`
+
+
 Version 3.1.6
 -------------
 

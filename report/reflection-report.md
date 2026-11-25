@@ -159,12 +159,123 @@ The agent formed three hypotheses and tested each one by running code. Every cla
 
 ## 3. Patch Implementation and Validation
 
-*To be completed in Part 3.*
+### 3.1 The patch
 
-- Summary of the patch and why it fixes the bug
-- How the agent generated and refined the patch
-- Test results before and after: reproduction tests, additional tests, regression suite
-- Remaining limitations
+The patch changes only `src/jinja2/idtracking.py` (+23/−4 lines), plus a `CHANGES.rst` entry. It does not modify `meta.py` or the compiler: once the symbol table is right, `find_undeclared_variables()` and the generated code both follow from it.
+
+**1. One branch per real path (`FrameSymbolVisitor.visit_If`).** Each `elif` is now analyzed as a separate branch, together with its own test expression, which only runs on that path. The `else` is always included, and a missing `else` becomes an empty branch, because it is a real path on which nothing is assigned. The "empty `elif` slot" from 3.1.4 is gone.
+
+```python
+branch_symbols = [inner_visit(node.body)]
+branch_symbols.extend(
+    inner_visit([elif_.test, *elif_.body]) for elif_ in node.elif_
+)
+branch_symbols.append(inner_visit(node.else_ or ()))
+self.symbols.branch_update(branch_symbols)
+```
+
+**2. Keep "assigned first on every path" (`Symbols.branch_update`).** Before falling back to `resolve`, the merge checks whether *every* branch recorded the name as `undefined`, meaning that branch assigns it before any read. If so, the earlier value is never used, so the name stays `undefined` and is not looked up from the context.
+
+```python
+if all(
+    branch.loads.get(target) == (VAR_LOAD_UNDEFINED, None)
+    for branch in branch_symbols
+):
+    self.loads[target] = (VAR_LOAD_UNDEFINED, None)
+    continue
+self.loads[target] = (VAR_LOAD_RESOLVE, name)
+```
+
+**Why this fixes the bug without reopening #1253.** The decision is based on every branch's own answer, not on a count of stores and not on whichever branch was merged last. Any of the following keeps the name as `resolve`:
+- a branch that never assigns it (including a missing `else`);
+- a branch that reads it first (#1253, or a read in an `elif` test);
+- a nested `if` that assigns it on only some paths.
+
+A name that is visible from an outer scope still becomes `alias`, exactly as before. Because the check runs on the real list of paths, it covers any number of `elif`s, nesting, loops and macros, and every assignment form: `set`, `set` blocks, tuple unpacking, `macro` and imports.
+
+### 3.2 How the agent produced the patch
+
+The agent wrote the patch directly from the Part 2 requirement: "every real path assigns before reading". It changed the two places Part 2 had identified, and the first version passed every test. It did not stop there. It then:
+
+- **Probed 13 edge cases** that the tests did not yet cover, checking both the `meta` result and the rendered output. Cases included a read in an `elif` test, a read before the `if`, a read before the assignment in the `else`, `is defined`, `include`, an outer variable in a `for` loop, and async rendering. All 13 were correct.
+- **Ran the new tests against unpatched 3.1.6 and against 3.1.4** to prove they can tell a correct fix from a wrong one (Section 3.3).
+- **Used the repository's own lint setup.** The latest `ruff` flagged formatting in code the patch never touched. The agent traced this to a version mismatch and re-ran with the version pinned in `.pre-commit-config.yaml` (0.8.4), which passes. `mypy` reports no issues in `idtracking.py`.
+
+There was no failed patch to correct in this part. The groundwork from Part 2, in particular rejecting the obvious revert, is the reason.
+
+### 3.3 Test results
+
+The new tests cover three levels:
+- **`find_undeclared_variables()` results:** `TestMeta.test_find_undeclared_variables_if_branches`, 15 cases.
+- **Rendering still uses the context when it should:** `TestIfCondition.test_set_in_branches_context_fallback`, 5 cases.
+- **The symbol table itself:** `test_if_branching_stores_all_branches` and `test_if_branching_stores_elif_missing`.
+
+There are two kinds of case:
+
+- **Bug cases:** a name assigned on every path must *not* be reported. Examples are many `elif`s, nested exhaustive `if`s, `set` blocks, tuple unpacking, reading after assigning, and `if` inside `for` or a macro. These fail before the patch.
+- **Guard cases:** the name must *still* be reported or read from the context. Examples are no `else`, one `elif` that skips the assignment, a nested `if` without `else`, a read before the assignment, a read in an `elif` test, and a read before the `if`. These pass before and after. They exist so that a fix which hides too much fails.
+
+| Tests | 3.1.6 (before) | 3.1.6 + patch | 3.1.4 (wrong in the other direction) |
+| --- | --- | --- | --- |
+| Reproduction tests (Part 1), 2 tests | 2 fail | pass | 1 fails (`if/else`) |
+| New `meta` tests, 15 cases | 8 bug cases fail, 7 guards pass | all pass | 9 fail, including guards `one-elif-skips` and `read-in-elif-test` |
+| New render tests, 5 cases | pass | pass | 2 guards fail (`elif-path-skips`, `elif-test-reads`) |
+| New symbol-table tests, 2 tests | 1 fails | pass | pass |
+| #1253 regression test (existing) | pass | pass | **fails** |
+| Full suite | 2 failed, 909 passed | **933 passed** | — |
+
+The before and after runs show the expected pattern. Before the patch, exactly the bug cases fail. After it, everything passes. Against 3.1.4, whose rule was wrong in the opposite direction, the guards and the #1253 test fail. So the new tests reject both the 3.1.5+ behavior and a revert to 3.1.4.
+
+**How to verify** (from the repo root, after the setup in Section 1.4):
+
+```bash
+.venv/bin/python -m pytest -q                                   # 933 passed
+.venv/bin/python -m pytest tests/test_api.py::TestMeta \
+    tests/test_core_tags.py::TestIfCondition tests/test_idtracking.py -v
+mkdir -p /tmp/j3.1.6 && git archive 3.1.6 src | tar -x -C /tmp/j3.1.6
+PYTHONPATH=/tmp/j3.1.6/src .venv/bin/python -m pytest -q \
+    tests/test_api.py::TestMeta tests/test_core_tags.py::TestIfCondition \
+    tests/test_idtracking.py                                    # 11 failed, 28 passed
+```
+
+### 3.4 Remaining limitations
+
+- **A variable set and used only inside one branch is still reported.** In `{% if x %}{% set y = 1 %}{{ y }}{% endif %}`, `y` is never read from the context. It is still reported, because no path after the `if` assigns it and Jinja does not check whether it is used later. Fixing that needs a "used after this point" analysis, which is a larger change than #2069. 3.1.4 behaved the same way.
+
+    To see it, run the Part 1 template set against the patched code:
+
+    ```bash
+    .venv/bin/python report/scripts/version_matrix.py
+    ```
+
+    13 of the 14 shapes print `OK`. The only remaining failure is this case:
+
+    ```
+    FAIL use inside the branch only       expected=['x'] got=['x', 'y']
+    ```
+
+    To see why, compare what the template renders with the code Jinja generates for it:
+
+    ```bash
+    .venv/bin/python -c "
+    from jinja2 import Environment, meta
+    env = Environment()
+    src = '{% if x %}{% set y = 1 %}{{ y }}{% endif %}'
+    print(sorted(meta.find_undeclared_variables(env.parse(src))))
+    print([env.from_string(src).render(x=x, y='CTX') for x in (True, False)])
+    print([l.strip() for l in env.compile(src, raw=True).splitlines() if 'resolve(' in l])
+    "
+    ```
+
+    ```
+    ['x', 'y']
+    ['1', '']
+    ["l_0_x = resolve('x')", "l_0_y = resolve('y')"]
+    ```
+
+    The second line shows that the context value `'CTX'` is never printed, so reporting `y` is a false positive. The third line shows the cause. Next to the expected lookup for `x`, the compiler still emits one for `y`, because on the path where `x` is false `y` is left unassigned, and Jinja does not check whether `y` is used after the `if`. `meta` faithfully reports that lookup. The result is a harmless over-approximation: an unused lookup, never a wrong render.
+- **The generated code changes slightly.** For names assigned on every path, the compiler now emits `l_0_y = missing` instead of a context lookup. Rendering output is unchanged, as the render tests confirm. However, a custom `Context` subclass that counts or logs lookups would see one fewer lookup.
+- **The changelog version is a guess.** The `CHANGES.rst` entry is placed under an unreleased 3.1.7, because the assignment requires starting from 3.1.6.
 
 ## 4. Reflection on Coding Agent Performance
 

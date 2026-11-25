@@ -121,6 +121,10 @@ class Symbols:
             self._define_ref(name, load=(VAR_LOAD_RESOLVE, name))
 
     def branch_update(self, branch_symbols: t.Sequence["Symbols"]) -> None:
+        """Merge the symbols of mutually exclusive branches back into this
+        scope. ``branch_symbols`` must contain one entry per possible path,
+        including an empty one for a missing ``else``.
+        """
         stores: t.Set[str] = set()
 
         for branch in branch_symbols:
@@ -142,6 +146,17 @@ class Symbols:
                 if outer_target is not None:
                     self.loads[target] = (VAR_LOAD_ALIAS, outer_target)
                     continue
+
+            # If every path assigns the name before reading it, the value
+            # from before the branches is never used, so it does not need
+            # to be resolved from the context.
+            if all(
+                branch.loads.get(target) == (VAR_LOAD_UNDEFINED, None)
+                for branch in branch_symbols
+            ):
+                self.loads[target] = (VAR_LOAD_UNDEFINED, None)
+                continue
+
             self.loads[target] = (VAR_LOAD_RESOLVE, name)
 
     def dump_stores(self) -> t.Dict[str, str]:
@@ -262,10 +277,14 @@ class FrameSymbolVisitor(NodeVisitor):
             self.symbols = original_symbols
             return rv
 
-        body_symbols = inner_visit(node.body)
-        elif_symbols = inner_visit(node.elif_)
-        else_symbols = inner_visit(node.else_ or ())
-        self.symbols.branch_update([body_symbols, elif_symbols, else_symbols])
+        # Each elif is a separate path, and its test is only evaluated on
+        # that path. A missing else is an empty path.
+        branch_symbols = [inner_visit(node.body)]
+        branch_symbols.extend(
+            inner_visit([elif_.test, *elif_.body]) for elif_ in node.elif_
+        )
+        branch_symbols.append(inner_visit(node.else_ or ()))
+        self.symbols.branch_update(branch_symbols)
 
     def visit_Macro(self, node: nodes.Macro, **kwargs: t.Any) -> None:
         self.symbols.store(node.name)

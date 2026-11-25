@@ -337,6 +337,53 @@ class TestIfCondition:
         tmpl = env.from_string("{% if true %}{% set foo = 1 %}{% endif %}{{ foo }}")
         assert tmpl.render() == "1"
 
+    @pytest.mark.parametrize(
+        ("source", "context", "expect"),
+        [
+            # Assigned on every path: the context value is never used.
+            pytest.param(
+                "{% if a %}{% set y = 1 %}{% elif b %}{% set y = 2 %}"
+                "{% else %}{% set y = 3 %}{% endif %}{{ y }}",
+                {"a": False, "b": False},
+                "3",
+                id="all-paths-assign",
+            ),
+            pytest.param(
+                "{% for i in seq %}{% if i %}{% set y = 1 %}{% else %}"
+                "{% set y = 2 %}{% endif %}{{ y }}{% endfor %}",
+                {"seq": [1, 0]},
+                "12",
+                id="inside-for",
+            ),
+            # The path taken does not assign it, or reads it first: the
+            # context value is used.
+            pytest.param(
+                "{% if a %}{% set y = 1 %}{% elif b %}{% set y = 2 %}"
+                "{% elif c %}{% else %}{% set y = 3 %}{% endif %}{{ y }}",
+                {"a": False, "b": False, "c": True},
+                "ctx",
+                id="elif-path-skips",
+            ),
+            pytest.param(
+                "{% if a %}{% set y = 1 %}{% else %}{{ y }}{% set y = 2 %}"
+                "{% endif %}{{ y }}",
+                {"a": False},
+                "ctx2",
+                id="else-reads-first",
+            ),
+            pytest.param(
+                "{% if a %}{% set y = 1 %}{% elif y %}{% set y = 2 %}"
+                "{% else %}{% set y = 3 %}{% endif %}{{ y }}",
+                {"a": False},
+                "2",
+                id="elif-test-reads",
+            ),
+        ],
+    )
+    def test_set_in_branches_context_fallback(self, env, source, context, expect):
+        tmpl = env.from_string(source)
+        assert tmpl.render(context, y="ctx") == expect
+
 
 class TestMacros:
     def test_simple(self, env_trim):
